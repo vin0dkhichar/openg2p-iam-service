@@ -1,14 +1,18 @@
 from typing import Annotated
+from urllib.parse import urlencode
 
-from fastapi import Depends, Response
+from fastapi import Depends, Request
+from fastapi.responses import RedirectResponse
 from openg2p_fastapi_common.controller import BaseController
 from iam_core.schemas import (
+    AuthCredentials,
     AuthPrincipal,
     LoginProviderHttpResponse,
     StartAuthTransactionResponse,
 )
-from iam_core.services import AuthService
-from iam_core.user_auth.dependencies import auth_principal, require_auth
+from iam_core.services import AuthService, ProviderRepository
+from iam_core.user_auth.dependencies import JwtBearerAuth, UnauthorizedError, auth_principal, require_auth
+from iam_core.user_auth.oidc_client import OidcClient
 
 from ..config import Settings
 
@@ -21,12 +25,13 @@ class AuthController(BaseController):
     '''
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.provider_repository = ProviderRepository.get_component()
         self.router.prefix += "/auth"
         self.router.tags += ["/auth"]
         self.auth_service = AuthService()
 
         self.router.add_api_route("/get_user_profile", self.get_user_profile, methods=["GET"])
-        self.router.add_api_route("/logout", self.logout, methods=["POST"])
+        self.router.add_api_route("/logout", self.logout, methods=["GET"])
         self.router.add_api_route(
             "/get_login_providers",
             self.get_login_providers,
@@ -49,7 +54,45 @@ class AuthController(BaseController):
     ):
         return auth.model_dump(exclude={"credentials"})
 
-    async def logout(self, response: Response):
+    async def logout(
+        self,
+        request: Request,
+        auth: Annotated[
+            AuthCredentials,
+            Depends(JwtBearerAuth())
+        ],
+    ):
+        issuer = getattr(auth, "iss", None)
+
+        login_provider = await self.provider_repository.get_by_iss(issuer)
+        if not login_provider:
+            raise UnauthorizedError("G2P-AUT-401", "Invalid issuer")
+
+        redirect_uri = getattr(login_provider, "default_redirect_uri", None)
+
+        oidc_client = OidcClient()
+        metadata = await oidc_client.get_server_metadata(login_provider)
+
+        logout_endpoint = metadata.get("end_session_endpoint")
+        if not logout_endpoint:
+            raise Exception("Logout endpoint not available in provider metadata")
+
+        id_token = request.cookies.get("X-ID-Token")
+
+        params = {
+            "post_logout_redirect_uri": redirect_uri,
+        }
+
+        if id_token:
+            params["id_token_hint"] = id_token
+
+        if getattr(login_provider, "client_id", None):
+            params["client_id"] = login_provider.client_id
+
+        logout_url = f"{logout_endpoint}?{urlencode(params)}"
+
+        response = RedirectResponse(url=logout_url)
+
         response.delete_cookie(
             "X-Access-Token",
             path=_config.auth_cookie_path,
@@ -60,6 +103,8 @@ class AuthController(BaseController):
             path=_config.auth_cookie_path,
             domain=_config.auth_cookie_domain,
         )
+
+        return response
 
     async def get_login_providers(self):
         return await self.auth_service.get_login_providers()
